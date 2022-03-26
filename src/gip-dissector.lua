@@ -111,12 +111,20 @@ function gip.dissector(buffer, pinfo, tree)
 
     -- Header
     local command = buffer(0,1):uint()
+    local direction = ""
+
+    if pinfo.p2p_dir == 0 then
+        direction = " out"
+    elseif pinfo.p2p_dir == 1 then
+        direction = " in"
+    end
+
     if is_internal(buffer) then
         header:add(pf_gip_report, buffer(0,1))
-        pinfo.cols.info = "GIP " .. ms_gip_reports[buffer(0,1):uint()]
+        pinfo.cols.info = "GIP " .. ms_gip_reports[buffer(0,1):uint()] .. direction
     else
         header:add(pf_acc_report, buffer(0,1))
-        pinfo.cols.info = "ACC " .. ms_acc_reports[buffer(0,1):uint()]
+        pinfo.cols.info = "ACC " .. ms_acc_reports[buffer(0,1):uint()] .. direction
     end
 
     header:add(pf_client_id, buffer(1,1))
