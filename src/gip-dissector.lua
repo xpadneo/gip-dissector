@@ -36,6 +36,7 @@ local ms_gip_powersupply = {
     [0x0C] = "invalid/unknown",
 }
 
+-- GIP Header
 local pf_gip_report   = ProtoField.uint8 ("gip.gip_report", "GIP Report", base.HEX_DEC, ms_gip_reports, nil, "internal command")
 local pf_acc_report   = ProtoField.uint8 ("gip.acc_report", "ACC Report", base.HEX_DEC, ms_acc_reports, nil, "external command")
 local pf_client_id    = ProtoField.uint8 ("gip.client_id", "Client", base.DEC, nil, 0x0F, "session ID of a connected client")
@@ -44,10 +45,11 @@ local pf_report_type  = ProtoField.bool  ("gip.internal", "Report Type", 8, {"GI
 local pf_chunk_start  = ProtoField.bool  ("gip.chunk_start", "First Chunk", 8, nil, 0x40, "is this the first chunk?")
 local pf_chunk        = ProtoField.bool  ("gip.chunk", "Chunk", 8, nil, 0x80, "is this a chunk?")
 local pf_sequence     = ProtoField.uint8 ("gip.sequence", "Packet Sequence Number", base.DEC)
-local pf_ext_header   = ProtoField.bool  ("gip.extended_header", "Extended Header", 8, nil, 0x80, "the message contains an extended header")
-local pf_length       = ProtoField.uint8 ("gip.length", "Payload Length", base.DEC, nil, 0x7F)
-local pf_chunk_offset = ProtoField.uint8 ("gip.chunk_offset", "Chunk Offset Parameter (8 bit)", base.DEC, nil, nil, "meaning depends on context")
-local pf_chunk_extra  = ProtoField.uint16("gip.chunk_extra", "Chunk Offset Parameter (14 bit)", base.DEC, nil, nil, "meaning depends on context")
+local pf_length       = ProtoField.bytes ("gip.length", "Payload Length", base.SPACE, nil)
+
+-- Chunk Header
+local pf_chunk_total  = ProtoField.bytes ("gip.chunk_total", "Chunk Total Parameter", base.SPACE, nil, nil)
+local pf_chunk_offset = ProtoField.bytes ("gip.chunk_offset", "Chunk Offset Parameter", base.SPACE, nil, nil)
 
 local pf_payload      = ProtoField.bytes ("gip.payload", "Unknown Data", base.SPACE)
 
@@ -68,10 +70,10 @@ gip.fields = {
     pf_gip_report, pf_acc_report,
     pf_client_id, pf_acknowledge, pf_report_type, pf_chunk_start, pf_chunk,
     pf_sequence,
-    pf_ext_header, pf_length,
+    pf_length,
 
     -- Payloads
-    pf_chunk_offset, pf_chunk_extra,
+    pf_chunk_total, pf_chunk_offset,
     pf_payload,
     pf_online, pf_charging, pf_psy_mode, pf_capacity,
     pf_btn_a, pf_btn_b, pf_btn_x, pf_btn_y,
@@ -85,10 +87,22 @@ local function is_internal(buffer)
     return bit.band(buffer(1,1):uint(), 0x20) > 0
 end
 
-local function sevenbit_le(buffer)
-    local low = bit.band(buffer(GIP_HDR_LEN,1):uint(), 0x7F)
-    local high = bit.lshift(buffer(GIP_HDR_LEN+1,1):uint(), 7);
-    return high + low
+-- unsigned LEB128 implementation
+-- https://en.wikipedia.org/wiki/LEB128
+local function dissect_leb128(buffer, start_offset)
+    local offset, shift, byte = start_offset, 0, 0
+    local value = 0
+
+    repeat
+        byte = buffer(offset,1):uint()
+        offset = offset + 1
+
+        value = bit.bor(value, bit.lshift(bit.band(byte, 0x7F), shift))
+        shift = shift + 7
+    until bit.band(byte, 0x80) == 0
+
+    local length = offset - start_offset
+    return value, length
 end
 
 function gip.dissector(buffer, pinfo, tree)
@@ -101,12 +115,13 @@ function gip.dissector(buffer, pinfo, tree)
 
     pinfo.cols.protocol = gip.name
 
-    local extended = bit.band(buffer(3,1):uint(), 0x80) > 0
-    local  chunked = bit.band(buffer(1,1):uint(), 0x80) > 0
-    local   length = bit.band(buffer(3,1):uint(), 0x7F)
-    local  subtree = tree:add(gip, buffer(), "Microsoft GIP Data")
-    local   header = subtree:add(gip, buffer(), "Header")
-    local  payload = subtree:add(gip, buffer(), "Payload")
+    local chunk_start       = bit.band(buffer(1,1):uint(), 0x40) > 0
+    local chunked           = bit.band(buffer(1,1):uint(), 0x80) > 0
+    local length, length_sz = dissect_leb128(buffer, 3)
+
+    local subtree = tree:add(gip, buffer(), "Microsoft GIP Data")
+    local  header = subtree:add(gip, buffer(), "Header")
+    local payload = subtree:add(gip, buffer(), "Payload")
 
 
     -- Header
@@ -133,20 +148,28 @@ function gip.dissector(buffer, pinfo, tree)
     header:add(pf_chunk_start, buffer(1,1))
     header:add(pf_chunk, buffer(1,1))
     header:add(pf_sequence, buffer(2,1))
-    header:add(pf_ext_header, buffer(3,1))
-    header:add(pf_length, buffer(3,1))
+    header:add(pf_length, buffer(3,length_sz)):append_text(" (" .. length .. ")")
+
+    offset = offset + length_sz - 1
 
     -- Payload
     local mode = ""
     if chunked then
-        --TODO maybe reassemble packet stream? (used for TLS and audio)
-        offset = offset + 2
-        if extended then
-            payload:add(pf_chunk_offset, buffer(GIP_HDR_LEN+1,1))
+        local chunk_param, chunk_param_sz = dissect_leb128(buffer, offset)
+
+        if chunk_start then
+            payload:add(pf_chunk_total, buffer(offset,chunk_param_sz)):append_text(" (" .. chunk_param .. ")")
         else
-            payload:add(pf_chunk_extra, buffer(GIP_HDR_LEN,2), sevenbit_le(buffer))
+            payload:add(pf_chunk_offset, buffer(offset,chunk_param_sz)):append_text(" (" .. chunk_param .. ")")
         end
-        if chunked then mode = " (chunked)" end
+
+        offset = offset + chunk_param_sz
+
+        --TODO maybe reassemble packet stream? (used for TLS and audio)
+        if chunked then
+            mode = " (chunked)"
+            if length == 0 then mode = " (end of chunks)" end
+        end
     end
 
     if is_internal(buffer) and command == 0x03 then
@@ -159,7 +182,7 @@ function gip.dissector(buffer, pinfo, tree)
         payload:add(pf_btn_b, buffer(GIP_HDR_LEN,1))
         payload:add(pf_btn_x, buffer(GIP_HDR_LEN,1))
         payload:add(pf_btn_y, buffer(GIP_HDR_LEN,1))
-    else
+    elseif length > 0 then
         payload:add(pf_payload, buffer(offset,length)):append_text(mode)
     end
 end
@@ -181,10 +204,18 @@ local function heuristic_checker(buffer, pinfo, tree)
         if ms_acc_reports[command] == nil then return false end
     end
 
+    -- calculate expected length with LEB128 fields
+    local payload, payload_sz = dissect_leb128(buffer, 3)
+    local      payload_offset = payload_sz + GIP_HDR_LEN - 1
+    local            expected = payload_offset + payload
+
+    local chunked = bit.band(buffer(1,1):uint(), 0x80) > 0
+    if chunked then
+        local chunk_param, chunk_param_sz = dissect_leb128(buffer, payload_offset)
+        expected = expected + chunk_param_sz
+    end
+
     -- length does match?
-    local expected = bit.band(buffer(3,1):uint(), 0x7F) + GIP_HDR_LEN
-    local  chunked = bit.band(buffer(1,1):uint(), 0x80) > 0
-    if chunked then expected = expected + 2 end
     if expected ~= buffer:len() then return false end
 
     -- seems to be a GIP conversation
